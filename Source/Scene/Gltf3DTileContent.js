@@ -1,9 +1,12 @@
+import Cartesian3 from "../Core/Cartesian3.js";
 import Color from "../Core/Color.js";
 import ComponentDatatype from "../Core/ComponentDatatype.js";
 import defaultValue from "../Core/defaultValue.js";
 import defined from "../Core/defined.js";
 import destroyObject from "../Core/destroyObject.js";
 import DeveloperError from "../Core/DeveloperError.js";
+import Matrix3 from "../Core/Matrix3.js";
+import Quaternion from "../Core/Quaternion.js";
 import RequestType from "../Core/RequestType.js";
 import Pass from "../Renderer/Pass.js";
 import hasExtension from "../ThirdParty/GltfPipeline/hasExtension.js";
@@ -205,6 +208,78 @@ function getComponentDatatype(type) {
   }
 }
 
+function getBufferViewData(gltf, bufferViewId) {
+  var buffer = gltf.buffers[0].extras._pipeline.source;
+  var bufferView = gltf.bufferViews[bufferViewId];
+  var byteOffset = defaultValue(bufferView.byteOffset, 0);
+  var byteLength = bufferView.byteLength;
+  return new Uint8Array(
+    buffer.buffer,
+    buffer.byteOffset + byteOffset,
+    byteLength
+  );
+}
+
+function getNumberOfComponents(type) {
+  switch (type) {
+    case "SCALAR":
+      return 1;
+    case "VEC2":
+      return 2;
+    case "VEC3":
+      return 3;
+    case "VEC4":
+      return 4;
+    case "MAT2":
+      return 4;
+    case "MAT3":
+      return 9;
+    case "MAT4":
+      return 16;
+  }
+}
+
+function getComponentType(componentDatatype) {
+  switch (componentDatatype) {
+    case ComponentDatatype.BYTE:
+      return "BYTE";
+    case ComponentDatatype.UNSIGNED_BYTE:
+      return "UNSIGNED_BYTE";
+    case ComponentDatatype.SHORT:
+      return "SHORT";
+    case ComponentDatatype.UNSIGNED_SHORT:
+      return "UNSIGNED_SHORT";
+    case ComponentDatatype.INT:
+      return "INT";
+    case ComponentDatatype.UNSIGNED_INT:
+      return "UNSIGNED_INT";
+    case ComponentDatatype.FLOAT:
+      return "FLOAT";
+    case ComponentDatatype.DOUBLE:
+      return "DOUBLE";
+  }
+}
+
+function getAccessorData(gltf, accessorId) {
+  var accessor = gltf.accessors[accessorId];
+  var bufferViewData = getBufferViewData(gltf, accessor.bufferView);
+
+  var byteOffset = bufferViewData.byteOffset + accessor.byteOffset;
+  var componentType = accessor.componentType;
+  var type = accessor.type;
+  var count = accessor.count;
+
+  var componentCount = getNumberOfComponents(type);
+  var length = count * componentCount;
+
+  return ComponentDatatype.createArrayBufferView(
+    componentType,
+    bufferViewData.buffer,
+    byteOffset,
+    length
+  );
+}
+
 function createBatchTable(content, gltf, colorChangedCallback) {
   if (
     hasExtension(gltf, "EXT_feature_metadata") &&
@@ -218,15 +293,7 @@ function createBatchTable(content, gltf, colorChangedCallback) {
     var i;
 
     for (i = 0; i < bufferViewsLength; ++i) {
-      var bufferView = gltf.bufferViews[i];
-      var byteOffset = defaultValue(bufferView.byteOffset, 0);
-      var byteLength = bufferView.byteLength;
-      var bufferViewData = new Uint8Array(
-        buffer.buffer,
-        buffer.byteOffset + byteOffset,
-        byteLength
-      );
-      bufferViews[i] = bufferViewData;
+      bufferViews[i] = getBufferViewData(gltf, i);
     }
 
     var extension = gltf.extensions.EXT_feature_metadata;
@@ -297,6 +364,230 @@ function createBatchTable(content, gltf, colorChangedCallback) {
         batchTableBinary,
         colorChangedCallback
       );
+    }
+  }
+}
+
+function getInstancePositions(gltf, translationAccessorId) {
+  return getAccessorData(gltf, translationAccessorId);
+}
+
+var scratchQuaternion = new Quaternion();
+var scratchRotation = new Matrix3();
+var scratchNormalUp = new Cartesian3();
+var scratchNormalRight = new Cartesian3();
+
+function getInstanceNormals(gltf, rotationAccessorId) {
+  var quaternions = getAccessorData(gltf, rotationAccessorId);
+  var length = quaternions.length / 4;
+
+  var normalized = false;
+  var type = MetadataType.FLOAT32;
+  var componentDatatype = ComponentDatatype.fromTypedArray(quaternions);
+  if (componentDatatype === ComponentDatatype.BYTE) {
+    normalized = true;
+    type = MetadataType.INT8;
+  } else if (componentDatatype === ComponentDatatype.SHORT) {
+    normalized = true;
+    type = MetadataType.INT16;
+  }
+
+  var normalUps = new Float32Array(length * 3);
+  var normalRights = new Float32Array(length * 3);
+
+  for (var i = 0; i < length; ++i) {
+    var quaternion = Quaternion.unpack(quaternions, i * 4, scratchQuaternion);
+    if (normalized) {
+      quaternion.x = MetadataType.normalize(quaternion.x, type);
+      quaternion.y = MetadataType.normalize(quaternion.y, type);
+      quaternion.z = MetadataType.normalize(quaternion.z, type);
+      quaternion.w = MetadataType.normalize(quaternion.w, type);
+    }
+    var rotationMatrix = Matrix3.fromQuaternion(quaternion, scratchRotation);
+    var normalUp = Cartesian3.normalize(
+      Matrix3.getColumn(rotationMatrix, 1, scratchNormalUp),
+      scratchNormalUp
+    );
+    var normalRight = Cartesian3.normalize(
+      Matrix3.getColumn(rotationMatrix, 0, scratchNormalRight),
+      scratchNormalRight
+    );
+    Cartesian3.pack(normalUp, normalUps, i * 3);
+    Cartesian3.pack(normalRight, normalRights, i * 3);
+  }
+
+  return {
+    normalUps: normalUps,
+    normalRights: normalRights,
+  };
+}
+
+function getInstanceScales(gltf, scaleAccessorId) {
+  return getAccessorData(gltf, scaleAccessorId);
+}
+
+function getInstanceBatchIds(gltf, featureIdAccessorId) {
+  var batchIds = getAccessorData(gltf, featureIdAccessorId);
+  var componentDatatype = ComponentDatatype.fromTypedArray(batchIds);
+  if (
+    componentDatatype !== ComponentDatatype.UNSIGNED_BYTE &&
+    componentDatatype !== ComponentDatatype.UNSIGNED_SHORT &&
+    componentDatatype !== ComponentDatatype.UNSIGNED_INT
+  ) {
+    batchIds = new Uint32Array(batchIds);
+  }
+  return batchIds;
+}
+
+function getPadding(byteLength, boundary, byteOffset) {
+  byteOffset = defaultValue(byteOffset);
+  var remainder = (byteOffset + byteLength) % boundary;
+  var padding = remainder === 0 ? 0 : boundary - remainder;
+  return padding;
+}
+
+function createFeatureTable(properties) {
+  var featureTableJson = {};
+
+  var propertiesLength = properties.length;
+  var featureTableBuffers = new Array(propertiesLength);
+  var featureTableByteOffsets = new Array(propertiesLength);
+  var byteOffset = 0;
+  var i;
+
+  for (i = 0; i < propertiesLength; ++i) {
+    var property = properties[i];
+    var name = property.name;
+    var typedArray = property.typedArray;
+    var hasComponentType = property.hasComponentType;
+    var propertyBuffer = new Uint8Array(
+      typedArray.buffer,
+      typedArray.byteOffset,
+      typedArray.byteLength
+    );
+    var componentDatatype = ComponentDatatype.fromTypedArray(typedArray);
+    var componentType = getComponentType(componentDatatype);
+    var boundary = ComponentDatatype.getSizeInBytes(componentDatatype);
+    var padding = getPadding(0, boundary, byteOffset);
+    byteOffset += padding;
+    featureTableBuffers[i] = propertyBuffer;
+    featureTableByteOffsets[i] = byteOffset;
+    var featureTableProperty = {
+      byteOffset: byteOffset,
+    };
+    if (hasComponentType) {
+      featureTableProperty.componentType = componentType;
+    }
+    featureTableJson[name] = featureTableProperty;
+    byteOffset += propertyBuffer.byteLength;
+  }
+
+  var featureTableBinaryByteLength = byteOffset;
+
+  var featureTableJsonString = JSON.stringify(featureTableJson);
+  var featureTableJsonByteLength = featureTableJsonString.length; // Feature Table JSON is ASCII
+
+  var featureTableJsonPadding = getPadding(featureTableJsonString.length, 8);
+  var featureTableBinaryPadding = getPadding(featureTableJsonString.length, 8);
+
+  var byteLength =
+    featureTableJsonByteLength +
+    featureTableJsonPadding +
+    featureTableBinaryByteLength +
+    featureTableBinaryPadding;
+
+  var featureTableBuffer = new Uint8Array(byteLength);
+
+  byteOffset = 0;
+  for (i = 0; i < featureTableJsonByteLength; ++i) {
+    featureTableBuffer.setUint8(i, featureTableJsonString.charCodeAt(i));
+  }
+  byteOffset += featureTableJsonByteLength;
+
+  for (i = 0; i < featureTableJsonPadding; ++i) {
+    featureTableBuffer.setUint8(byteOffset + i, 32); // Add space characters to end of JSON chunk
+  }
+  byteOffset += featureTableJsonPadding;
+
+  for (i = 0; i < propertiesLength; ++i) {
+    featureTableBuffer.set(
+      featureTableBuffers[i],
+      byteOffset + featureTableByteOffsets[i]
+    );
+  }
+  byteOffset += featureTableBinaryPadding;
+
+  for (i = 0; i < featureTableJsonPadding; ++i) {
+    featureTableBuffer.setUint8(byteOffset + i, 0); // Add 0's to end of binary chunk
+  }
+
+  return featureTableBuffer;
+}
+
+function createInstanced3DModel(gltf, node) {
+  var extension = node.extensions.EXT_mesh_gpu_instancing;
+  var attributes = extension.attributes;
+  var translationAccessorId = attributes.TRANSLATION;
+  var rotationAccessorId = attributes.ROTATION;
+  var scaleAccessorId = attributes.SCALE;
+  var featureIdAccessorId = attributes._FEATURE_ID_0;
+
+  var featureTableProperties = [];
+
+  if (defined(translationAccessorId)) {
+    var positions = getInstancePositions(gltf, translationAccessorId);
+    featureTableProperties.push({
+      name: "POSITION",
+      typedArray: positions,
+      hasComponentType: false,
+    });
+  }
+  if (defined(rotationAccessorId)) {
+    var normals = getInstanceNormals(gltf, rotationAccessorId);
+    var normalUps = normals.normalUps;
+    var normalRights = normals.normalRights;
+    featureTableProperties.push({
+      name: "NORMAL_UP",
+      typedArray: normalUps,
+      hasComponentType: false,
+    });
+    featureTableProperties.push({
+      name: "NORMAL_RIGHT",
+      typedArray: normalRights,
+      hasComponentType: false,
+    });
+  }
+  if (defined(scaleAccessorId)) {
+    var scales = getInstanceScales(gltf, scaleAccessorId);
+    featureTableProperties.push({
+      name: "SCALE_NON_UNIFORM",
+      typedArray: scales,
+      hasComponentType: false,
+    });
+  }
+  if (defined(featureIdAccessorId)) {
+    var batchIds = getInstanceBatchIds(gltf, featureIdAccessorId);
+    featureTableProperties.push({
+      name: "BATCH_ID",
+      typedArray: batchIds,
+      hasComponentType: true,
+    });
+  }
+
+  var featureTable = createFeatureTable(featureTableProperties);
+}
+
+function createInnerContents(gltf) {
+  var nodes = gltf.nodes;
+  if (defined(nodes)) {
+    var nodesLength = nodes.length;
+    for (var i = 0; i < nodesLength; ++i) {
+      var node = nodes[i];
+      if (
+        defined(node.extensions) &&
+        defined(node.extensions.EXT_mesh_gpu_instancing)
+      ) {
+      }
     }
   }
 }
