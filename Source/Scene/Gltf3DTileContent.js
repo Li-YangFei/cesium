@@ -577,19 +577,65 @@ function createInstanced3DModel(gltf, node) {
   var featureTable = createFeatureTable(featureTableProperties);
 }
 
+function removeNodesRecursive(gltf, nodes, instancedNodeId) {
+  // Remove nodes that don't have instancedNodeId as a descendant
+  var removeCount = 0;
+  var nodesLength = nodes.length;
+  for (var i = 0; i < nodesLength; ++i) {
+    var nodeId = nodes[i];
+    if (nodeId !== instancedNodeId) {
+      var node = gltf.nodes[nodeId];
+      if (defined(node.children)) {
+        removeNodesRecursive(gltf, node.children, instancedNodeId);
+        if (node.children.length === 0) {
+          node.children = undefined;
+        }
+      }
+      if (!defined(node.children)) {
+        ++removeCount;
+        continue;
+      }
+    }
+    if (removeCount > 0) {
+      nodes[i - removeCount] = nodeId;
+    }
+  }
+
+  nodes.length -= removeCount;
+}
+
+function removeNodes(gltf, instancedNodeId) {
+  if (defined(gltf.scenes) && defined(gltf.scene)) {
+    var scene = gltf.scenes[gltf.scene];
+    var nodes = scene.nodes;
+    if (defined(nodes)) {
+      removeNodesRecursive(gltf, nodes, instancedNodeId);
+    }
+  }
+}
+
 function createInnerContents(gltf) {
+  var i;
+  var instancedNodeIds = [];
+
   var nodes = gltf.nodes;
   if (defined(nodes)) {
     var nodesLength = nodes.length;
-    for (var i = 0; i < nodesLength; ++i) {
+    for (i = 0; i < nodesLength; ++i) {
       var node = nodes[i];
       if (
         defined(node.extensions) &&
         defined(node.extensions.EXT_mesh_gpu_instancing)
       ) {
+        instancedNodeIds.push(i);
       }
     }
   }
+
+  // var instancedNodesLength
+  // if (instancedNodeIds.length > 1) {
+  //   for (i = 0; i <
+  // }
 }
 
 function initialize(content, gltf) {
